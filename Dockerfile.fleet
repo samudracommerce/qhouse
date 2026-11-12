@@ -1,0 +1,11 @@
+# Q-House — image fleet. Python standar (tanpa pip). Staf masuk lewat voyage-gate (X-Voyage-Gate = GATE_SECRET);
+# halaman & API driver (/antri*, /api/publik/*) publik. Data di volume /data.
+FROM python:3.11-slim
+WORKDIR /app
+COPY server.py ./
+COPY static ./static
+ENV QH_DATA=/data PORT=8000
+RUN mkdir -p /data
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=3)"
+CMD ["python", "server.py"]
