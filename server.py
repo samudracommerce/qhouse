@@ -1,20 +1,24 @@
-"""Q-House — antrian pengambilan paket SPX Instant & Sameday di gudang (Sheva 12 Nov 2026).
+"""Q-House — antrian pengambilan paket SPX Instant & Sameday di gudang (Sheva 12 Nov 2026). Fitur Wareflow (app bs-acc).
 
-Bagian dari Wareflow (app gudang). Dibangun dari prototipe artifact "Antrian Gudang Instant".
 Python standar saja (tanpa dependensi), data di SQLite (/data/qhouse.db).
 
 Peran:
   - Driver (orang luar, TANPA akun Voyage): scan QR di pintu gudang -> /antri/instant | /antri/sameday, isi nama, HP,
-    nomor booking 4 karakter -> tiket. Halaman & API publik (/antri*, /api/publik/*) — data minimal, dibatasi per IP.
-  - Staf (lewat Caddy + voyage-gate; wajib X-Voyage-Gate = GATE_SECRET): Sorter, Loket, Supervisor, Barcode.
-    Peran dari X-Voyage-Role (Voyage › Akses App › Q-House): admin/supervisor = semua; sorter; loket;
+    nomor booking 4 karakter -> tiket. Halaman & API publik — data minimal, dibatasi per IP, satu tiket aktif per HP.
+  - Staf (lewat Caddy + voyage-gate fitur bs-acc/qhouse; wajib X-Voyage-Gate = GATE_SECRET): Sorter, Loket, Supervisor,
+    Barcode. Peran dari X-Voyage-Role (Voyage › Akses App › Wareflow): admin/supervisor = semua; sorter; loket;
     member = sorter + loket; viewer = lihat saja.
 
-Alur tiket: menunggu -> disiapkan (diambil sorter) -> siap (semua resi dipindai, dapat loket) -> selesai (serah terima loket).
-Cabang: bermasalah (booking tidak ditemukan; supervisor: cari ulang / keluarkan / batalkan), dibatalkan
-(supervisor, atau otomatis lewat batas ambil -> paket dikembalikan ke rak).
+Alur (Sheva 12 Nov 2026, versi 2):
+  menunggu -> disiapkan  : DIBAGI OTOMATIS ke sorter yang sedang membuka tab Sorter (beban paling sedikit). Sorter yang
+                           tabnya tertutup / sesi Voyage habis berhenti menerima; tiketnya kembali ke antrean setelah 5 menit.
+  disiapkan -> siap      : sorter menekan Done -> dapat loket (bergiliran per layanan).
+  siap -> selesai        : loket memindai NOMOR PESANAN marketplace tiap paket (jumlah = jumlah booking), lalu serah terima.
+  Pukul 01.00 WIB        : nomor pesanan yang selesai kemarin divalidasi ke BigSeller lewat Voyage (/api/v1/bigseller/cek-pesanan):
+                           cocok = ada & sudah diserahkan ke kurir. Yang tidak cocok tampil di tab Supervisor + lonceng Voyage.
+  Cabang: dibatalkan (supervisor, atau otomatis lewat batas ambil -> paket dikembalikan ke rak).
 """
-import contextlib, hmac, json, mimetypes, os, re, secrets, sqlite3, threading, time, urllib.parse
+import contextlib, hmac, json, mimetypes, os, re, secrets, sqlite3, threading, time, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -25,6 +29,9 @@ GATE_SECRET = os.environ.get("GATE_SECRET", "")
 NEED_GATE = os.environ.get("QH_REQUIRE_GATE", "1") == "1"
 PUBLIC_URL = os.environ.get("QH_PUBLIC_URL", "http://localhost:8113").rstrip("/")
 VOYAGE_URL = os.environ.get("QH_VOYAGE_URL", "").rstrip("/")
+VOYAGE_INTERNAL = os.environ.get("QH_VOYAGE_INTERNAL", "").rstrip("/")     # panggilan server-ke-server ke Voyage
+VOYAGE_KEY = os.environ.get("QH_VOYAGE_KEY", "")                          # api_key Voyage (= kunci layanan fleet)
+JAM_VALIDASI = int(os.environ.get("QH_JAM_VALIDASI", "1"))                # 01.00 WIB
 WIB = 7 * 3600
 
 LAYANAN = {"instant": {"label": "SPX Instant", "prefix": "I"}, "sameday": {"label": "SPX Sameday", "prefix": "S"}}
@@ -34,6 +41,9 @@ CONFIG_AWAL = {"lokets": [{"n": 1, "layanan": "instant", "open": True}, {"n": 2,
                "batasMenit": 30, "rr": {"instant": 0, "sameday": 0}}
 PERAN = {"admin": {"sorter", "loket", "supervisor"}, "supervisor": {"sorter", "loket", "supervisor"},
          "sorter": {"sorter"}, "loket": {"loket"}, "member": {"sorter", "loket"}, "viewer": set()}
+SORTER_AKTIF_DETIK = 120     # tab Sorter terbuka (polling; tab latar dibatasi browser ~1x/menit)
+SORTER_LEPAS_DETIK = 300     # sorter tak terlihat selama ini -> tiketnya kembali ke antrean
+NO_PESANAN = re.compile(r"^[A-Z0-9]{6,40}$")
 
 LOCK = threading.Lock()
 
@@ -46,16 +56,16 @@ def tgl_wib(ms):
     return time.strftime("%Y-%m-%d", time.gmtime(ms / 1000 + WIB))
 
 
-def hhmm(ms):
-    return time.strftime("%H.%M", time.gmtime(ms / 1000 + WIB)) if ms else "–"
-
-
 def norm_hp(s):
     return re.sub(r"\D", "", str(s or ""))[:16]
 
 
 def norm_kode(s):
     return re.sub(r"[^A-Z0-9]", "", str(s or "").upper())[:4]
+
+
+def norm_pesanan(s):
+    return re.sub(r"[^A-Z0-9]", "", str(s or "").upper())[:40]
 
 
 def db():
@@ -92,7 +102,16 @@ def init():
         CREATE INDEX IF NOT EXISTS idx_tiket_status ON tiket(status);
         CREATE INDEX IF NOT EXISTS idx_tiket_tgl ON tiket(tgl);
         CREATE TABLE IF NOT EXISTS pengaturan (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS hadir (email TEXT PRIMARY KEY, nama TEXT NOT NULL, role TEXT NOT NULL, peran TEXT NOT NULL,
+          tab TEXT NOT NULL DEFAULT '', last_seen INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS validasi (no_pesanan TEXT PRIMARY KEY, tiket_id TEXT NOT NULL, tiket_no TEXT NOT NULL,
+          tgl TEXT NOT NULL, hasil TEXT NOT NULL, status TEXT NOT NULL DEFAULT '', kurir TEXT NOT NULL DEFAULT '', cek_at INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS idx_validasi_tgl ON validasi(tgl);
         """)
+        kolom = {r[1] for r in c.execute("PRAGMA table_info(tiket)")}
+        for k, d in (("sorter_email", "TEXT"), ("pesanan", "TEXT NOT NULL DEFAULT '[]'"), ("siap_by", "TEXT"), ("done_by", "TEXT")):
+            if k not in kolom:
+                c.execute("ALTER TABLE tiket ADD COLUMN %s %s" % (k, d))
         if not c.execute("SELECT 1 FROM pengaturan WHERE key='config'").fetchone():
             c.execute("INSERT INTO pengaturan(key,value) VALUES('config',?)", (json.dumps(CONFIG_AWAL),))
 
@@ -102,6 +121,7 @@ def baris(r):
     t = dict(r)
     t["bookings"] = json.loads(t["bookings"])
     t["log"] = json.loads(t["log"])
+    t["pesanan"] = json.loads(t.get("pesanan") or "[]")
     return t
 
 
@@ -115,11 +135,21 @@ def set_config(c, cfg):
     c.execute("UPDATE pengaturan SET value=? WHERE key='config'", (json.dumps(cfg),))
 
 
+def get_set(c, key, awal):
+    r = c.execute("SELECT value FROM pengaturan WHERE key=?", (key,)).fetchone()
+    return json.loads(r[0]) if r else awal
+
+
+def put_set(c, key, val):
+    c.execute("INSERT INTO pengaturan(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, json.dumps(val)))
+
+
 def simpan(c, t):
-    c.execute("""UPDATE tiket SET layanan=?, status=?, loket=?, sorter=?, taken_at=?, ready_at=?, done_at=?, cancel_reason=?,
-                 returned=?, bookings=?, log=? WHERE id=?""",
-              (t["layanan"], t["status"], t["loket"], t["sorter"], t["taken_at"], t["ready_at"], t["done_at"],
-               t["cancel_reason"], int(bool(t["returned"])), json.dumps(t["bookings"]), json.dumps(t["log"][-40:]), t["id"]))
+    c.execute("""UPDATE tiket SET layanan=?, status=?, loket=?, sorter=?, sorter_email=?, taken_at=?, ready_at=?, done_at=?,
+                 cancel_reason=?, returned=?, bookings=?, log=?, pesanan=?, siap_by=?, done_by=? WHERE id=?""",
+              (t["layanan"], t["status"], t["loket"], t["sorter"], t.get("sorter_email"), t["taken_at"], t["ready_at"], t["done_at"],
+               t["cancel_reason"], int(bool(t["returned"])), json.dumps(t["bookings"]), json.dumps(t["log"][-40:]),
+               json.dumps(t.get("pesanan") or []), t.get("siap_by"), t.get("done_by"), t["id"]))
 
 
 def catat(t, aksi, oleh=""):
@@ -174,6 +204,54 @@ def antrian(c):
     return [baris(r) for r in c.execute("SELECT * FROM tiket WHERE status IN ('menunggu','disiapkan') ORDER BY created_at")]
 
 
+# ---------- sorter: kehadiran & pembagian otomatis ----------
+def hadir_catat(c, me, tab):
+    if not me["email"]:
+        return
+    c.execute("""INSERT INTO hadir(email,nama,role,peran,tab,last_seen) VALUES(?,?,?,?,?,?)
+                 ON CONFLICT(email) DO UPDATE SET nama=excluded.nama, role=excluded.role, peran=excluded.peran, tab=excluded.tab,
+                 last_seen=excluded.last_seen""", (me["email"], me["nama"], me["role"], json.dumps(me["peran"]), tab or "", now_ms()))
+
+
+def sorter_aktif(c):
+    batas = now_ms() - SORTER_AKTIF_DETIK * 1000
+    return [dict(r) for r in c.execute("SELECT email, nama FROM hadir WHERE tab='sorter' AND last_seen >= ? AND peran LIKE '%\"sorter\"%'"
+                                       " ORDER BY nama", (batas,))]
+
+
+def bagikan(c):
+    """Lepas tiket dari sorter yang menghilang, lalu bagi tiket 'menunggu' ke sorter aktif dengan beban paling sedikit."""
+    t0 = now_ms()
+    # dilepas bila sorternya tidak terlihat di tab mana pun (pindah tab Loket sebentar tidak melepas tiketnya)
+    terlihat = {r["email"]: r["last_seen"] for r in c.execute("SELECT email, last_seen FROM hadir")}
+    for r in c.execute("SELECT * FROM tiket WHERE status='disiapkan' AND sorter_email IS NOT NULL").fetchall():
+        if terlihat.get(r["sorter_email"], 0) < t0 - SORTER_LEPAS_DETIK * 1000:
+            t = baris(r)
+            catat(t, "Dikembalikan ke antrean: sorter %s tidak aktif" % (t["sorter"] or ""))
+            t["status"], t["sorter"], t["sorter_email"], t["taken_at"] = "menunggu", None, None, None
+            simpan(c, t)
+    aktif = sorter_aktif(c)
+    if not aktif:
+        return
+    beban = {s["email"]: 0 for s in aktif}
+    for (e, n) in c.execute("SELECT sorter_email, COUNT(*) FROM tiket WHERE status='disiapkan' GROUP BY sorter_email"):
+        if e in beban:
+            beban[e] = n
+    nama = {s["email"]: s["nama"] for s in aktif}
+    for r in c.execute("SELECT * FROM tiket WHERE status='menunggu' ORDER BY created_at").fetchall():
+        e = min(beban, key=lambda x: (beban[x], nama[x]))
+        t = baris(r)
+        t["status"], t["sorter"], t["sorter_email"], t["taken_at"] = "disiapkan", nama[e], e, now_ms()
+        catat(t, "Dibagikan otomatis ke sorter %s" % nama[e])
+        simpan(c, t)
+        beban[e] += 1
+
+
+def rawat(c):
+    kedaluwarsa(c)
+    bagikan(c)
+
+
 # ---------- publik (driver) ----------
 _RATE = {}
 
@@ -195,7 +273,7 @@ def mask_hp(hp):
 
 
 def tiket_publik(c, t):
-    """Yang boleh dilihat driver lewat token: tanpa resi, HP disamarkan."""
+    """Yang boleh dilihat driver lewat token: tanpa nomor pesanan, HP disamarkan."""
     cfg = get_config(c)
     q = [x["id"] for x in antrian(c)]
     batas = int(cfg.get("batasMenit") or 30) * 60000
@@ -224,7 +302,7 @@ def buat_tiket(c, b, ip):
     if len(hp) < 9:
         return 400, {"error": "Isi nomor HP yang aktif (minimal 9 angka)."}
     if not kode or len(kode) > 30:
-        return 400, {"error": "Tambahkan 1–30 nomor booking (4 karakter)."}
+        return 400, {"error": "Isi 1–30 nomor booking (4 karakter)."}
     ada = c.execute("SELECT * FROM tiket WHERE hp=? AND status IN ('menunggu','disiapkan','siap','bermasalah') ORDER BY created_at DESC",
                     (hp,)).fetchone()
     if ada:
@@ -235,15 +313,114 @@ def buat_tiket(c, b, ip):
         return 429, {"error": "Terlalu banyak tiket dari perangkat ini. Coba lagi beberapa menit lagi."}
     t0 = now_ms()
     t = {"id": "t" + secrets.token_hex(6), "token": secrets.token_urlsafe(18), "tgl": tgl_wib(t0), "layanan": lay,
-         "nama": nama, "hp": hp, "plat": plat, "status": "menunggu", "loket": None, "sorter": None, "created_at": t0,
-         "taken_at": None, "ready_at": None, "done_at": None, "cancel_reason": None, "returned": 0,
          "bookings": [{"kode": k, "resi": None, "status": "menunggu"} for k in kode], "log": []}
     t["no"] = no_berikut(c, lay, t["tgl"])
     catat(t, "Tiket dibuat oleh driver")
     c.execute("""INSERT INTO tiket(id,token,no,tgl,layanan,nama,hp,plat,status,created_at,bookings,log)
                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
               (t["id"], t["token"], t["no"], t["tgl"], lay, nama, hp, plat, "menunggu", t0, json.dumps(t["bookings"]), json.dumps(t["log"])))
+    bagikan(c)
     return 200, {"token": t["token"], "no": t["no"]}
+
+
+# ---------- validasi BigSeller (pukul 01.00) ----------
+_VALIDASI_JALAN = threading.Event()
+
+
+def _voyage(path, body=None, timeout=900):
+    if not (VOYAGE_INTERNAL and VOYAGE_KEY):
+        raise RuntimeError("QH_VOYAGE_INTERNAL / QH_VOYAGE_KEY belum diisi")
+    h = {"X-Api-Key": VOYAGE_KEY, "X-Voyage-App": "qhouse"}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        h["Content-Type"] = "application/json"
+    req = urllib.request.Request(VOYAGE_INTERNAL + path, data=data, headers=h, method="POST" if body is not None else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            pesan = json.loads(e.read()).get("error")
+        except ValueError:
+            pesan = None
+        raise RuntimeError("Voyage %s: %s" % (e.code, pesan or e.reason))
+
+
+def hasil_dari(v):
+    if not v.get("ada"):
+        return "tidak_ditemukan"
+    if v.get("diserahkan"):
+        return "cocok"
+    return "batal" if "cancel" in (v.get("kode") or "") else "belum_diserahkan"
+
+
+def jalankan_validasi(tgl, oleh="jadwal"):
+    """Validasi nomor pesanan dari tiket yang SELESAI pada tanggal tgl (WIB). Aman dipanggil berulang (hasil ditimpa)."""
+    if _VALIDASI_JALAN.is_set():
+        return False
+    _VALIDASI_JALAN.set()
+    log = {"tgl": tgl, "mulai": now_ms(), "oleh": oleh, "total": 0, "cocok": 0, "masalah": 0, "error": ""}
+    try:
+        with tx() as c:
+            daftar = []
+            for r in c.execute("SELECT * FROM tiket WHERE status='selesai'").fetchall():
+                t = baris(r)
+                if t["done_at"] and tgl_wib(t["done_at"]) == tgl:
+                    daftar += [(no, t["id"], t["no"]) for no in t["pesanan"]]
+        log["total"] = len(daftar)
+        hasil = {}
+        for i in range(0, len(daftar), 50):
+            nomor = [x[0] for x in daftar[i:i + 50]]
+            hasil.update(_voyage("/api/v1/bigseller/cek-pesanan?no=" + urllib.parse.quote(",".join(nomor)))["hasil"])
+        t1 = now_ms()
+        with tx() as c:
+            for no, tid, tno in daftar:
+                v = hasil.get(no) or {"ada": False}
+                h = hasil_dari(v)
+                log["cocok" if h == "cocok" else "masalah"] += 1
+                c.execute("""INSERT INTO validasi(no_pesanan,tiket_id,tiket_no,tgl,hasil,status,kurir,cek_at) VALUES(?,?,?,?,?,?,?,?)
+                             ON CONFLICT(no_pesanan) DO UPDATE SET tiket_id=excluded.tiket_id, tiket_no=excluded.tiket_no, tgl=excluded.tgl,
+                             hasil=excluded.hasil, status=excluded.status, kurir=excluded.kurir, cek_at=excluded.cek_at""",
+                          (no, tid, tno, tgl, h, v.get("status") or "", v.get("kurir") or "", t1))
+    except Exception as e:                                    # dicatat; dicoba lagi pada putaran jadwal berikutnya
+        log["error"] = str(e)[:300]
+    finally:
+        log["selesai"] = now_ms()
+        with tx() as c:
+            semua = get_set(c, "validasi_log", {})
+            semua[tgl] = log
+            put_set(c, "validasi_log", dict(sorted(semua.items())[-30:]))
+            sup = [r["email"] for r in c.execute("SELECT email, peran FROM hadir WHERE last_seen >= ?", (now_ms() - 30 * 86400000,))
+                   if "supervisor" in json.loads(r["peran"])]
+        _VALIDASI_JALAN.clear()
+    if not log["error"] and log["masalah"] and sup:
+        try:
+            _voyage("/api/v1/hooks/fleet/kabari", {"to": sup, "app": "qhouse", "url": PUBLIC_URL + "/supervisor",
+                                                   "title": "Q-House: %d pesanan tidak cocok dengan BigSeller (%s)" % (log["masalah"], tgl),
+                                                   "body": "Dari %d nomor pesanan yang diserah-terimakan, %d tidak ditemukan / belum diserahkan "
+                                                           "ke kurir / batal di BigSeller. Lihat tab Supervisor." % (log["total"], log["masalah"])},
+                    timeout=20)
+        except Exception:
+            pass
+    return True
+
+
+def penjadwal():
+    """Tiap menit: setelah JAM_VALIDASI WIB, validasi tanggal kemarin sekali (gagal -> dicoba lagi menit berikutnya, maks. 1x/15 mnt)."""
+    while True:
+        try:
+            t = time.time() + WIB
+            jam = int(time.strftime("%H", time.gmtime(t)))
+            kemarin = time.strftime("%Y-%m-%d", time.gmtime(t - 86400))
+            if jam >= JAM_VALIDASI:
+                with tx() as c:
+                    lg = get_set(c, "validasi_log", {}).get(kemarin)
+                if not lg or (lg.get("error") and now_ms() - lg.get("selesai", 0) > 15 * 60000):
+                    jalankan_validasi(kemarin)
+        except Exception as e:
+            print("penjadwal validasi:", e, flush=True)
+        time.sleep(60)
 
 
 # ---------- staf ----------
@@ -251,8 +428,13 @@ def state(c, me):
     hari = tgl_wib(now_ms())
     rows = c.execute("SELECT * FROM tiket WHERE tgl=? OR status IN ('menunggu','disiapkan','siap','bermasalah')"
                      " OR (status='dibatalkan' AND ready_at IS NOT NULL AND returned=0) ORDER BY created_at", (hari,)).fetchall()
+    vlog = get_set(c, "validasi_log", {})
+    akhir = max(vlog) if vlog else None
+    masalah = [dict(r) for r in c.execute("SELECT * FROM validasi WHERE tgl=? AND hasil<>'cocok' ORDER BY tiket_no", (akhir,))] if akhir else []
     return {"me": me, "config": get_config(c), "tickets": [baris(r) for r in rows], "now": now_ms(),
-            "publicUrl": PUBLIC_URL, "voyageUrl": VOYAGE_URL, "layanan": LAYANAN}
+            "sorterAktif": sorter_aktif(c), "publicUrl": PUBLIC_URL, "voyageUrl": VOYAGE_URL, "layanan": LAYANAN,
+            "validasi": {"log": [vlog[k] for k in sorted(vlog, reverse=True)[:7]], "masalah": masalah[:300],
+                         "jalan": _VALIDASI_JALAN.is_set(), "siap": bool(VOYAGE_INTERNAL and VOYAGE_KEY), "jam": JAM_VALIDASI}}
 
 
 def aksi(c, b, me):
@@ -260,15 +442,24 @@ def aksi(c, b, me):
     a = b.get("aksi")
     peran = set(me["peran"])
     oleh = me["nama"]
-    perlu = {"ambil": "sorter", "scan": "sorter", "ulang": "sorter", "tidak_ditemukan": "sorter", "layanan": "sorter",
-             "siap": "sorter", "serah": "loket", "loket_buka": "supervisor", "loket_layanan": "supervisor",
-             "batas": "supervisor", "cari_ulang": "supervisor", "keluarkan": "supervisor", "batal": "supervisor",
-             "kembali_rak": "supervisor"}.get(a)
+    perlu = {"done": "sorter", "scan": "loket", "hapus_scan": "loket", "serah": "loket",
+             "loket_buka": "supervisor", "loket_layanan": "supervisor", "batas": "supervisor", "batal": "supervisor",
+             "kembali_rak": "supervisor", "lepas": "supervisor", "validasi": "supervisor"}.get(a)
     if not perlu:
         return 400, {"error": "Aksi tidak dikenal"}
     if perlu not in peran:
         return 403, {"error": "Akunmu tidak punya peran %s di Q-House." % perlu}
     cfg = get_config(c)
+    if a == "validasi":
+        tgl = str(b.get("tgl") or "")
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", tgl):
+            return 400, {"error": "Tanggal tidak valid"}
+        if not (VOYAGE_INTERNAL and VOYAGE_KEY):
+            return 409, {"error": "Validasi belum disambungkan ke Voyage (QH_VOYAGE_INTERNAL / QH_VOYAGE_KEY)."}
+        if _VALIDASI_JALAN.is_set():
+            return 409, {"error": "Validasi sedang berjalan."}
+        threading.Thread(target=jalankan_validasi, args=(tgl, oleh), daemon=True).start()
+        return 200, {"ok": True, "pesan": "Validasi %s dimulai" % tgl}
     if a in ("loket_buka", "loket_layanan", "batas"):
         if a == "batas":
             v = int(b.get("menit") or 0)
@@ -296,71 +487,51 @@ def aksi(c, b, me):
     t = ambil(c, str(b.get("id") or ""))
     if not t:
         return 404, {"error": "Tiket tidak ditemukan"}
-    bk = t["bookings"]
-    i = b.get("i")
-    i = int(i) if i is not None and str(i).lstrip("-").isdigit() else None
-    if i is not None and not 0 <= i < len(bk):
-        return 400, {"error": "Booking tidak dikenal"}
-    if a == "ambil":
-        if t["status"] != "menunggu":
-            return 409, {"error": "Tiket ini sudah diambil sorter lain."}
-        t["status"], t["sorter"], t["taken_at"] = "disiapkan", oleh, now_ms()
-        catat(t, "Diambil sorter %s" % oleh, oleh)
-    elif a == "scan":
-        if t["status"] != "disiapkan" or i is None or bk[i]["status"] != "menunggu":
-            return 409, {"error": "Booking ini tidak sedang menunggu pindai."}
-        resi = re.sub(r"\s", "", str(b.get("resi") or ""))[:40]
-        if len(resi) < 8:
-            return 400, {"error": "Nomor resi terlalu pendek. Pindai ulang barcode di label."}
-        for r in c.execute("SELECT no, bookings FROM tiket WHERE id<>? AND status IN ('menunggu','disiapkan','siap','bermasalah')", (t["id"],)):
-            if any(x.get("resi") == resi for x in json.loads(r["bookings"])):
-                return 409, {"error": "Resi ini sudah ada di tiket %s. Cek ulang paketnya." % r["no"]}
-        if any(j != i and x.get("resi") == resi for j, x in enumerate(bk)):
-            return 409, {"error": "Resi ini sudah dipindai untuk booking lain di tiket ini."}
-        bk[i]["resi"], bk[i]["status"] = resi, "dipindai"
-        catat(t, "Resi %s untuk %s" % (resi, bk[i]["kode"]), oleh)
-    elif a == "ulang":
-        if t["status"] != "disiapkan" or i is None or bk[i]["status"] != "dipindai":
-            return 409, {"error": "Booking ini belum dipindai."}
-        bk[i]["resi"], bk[i]["status"] = None, "menunggu"
-        catat(t, "Resi %s diulang" % bk[i]["kode"], oleh)
-    elif a == "tidak_ditemukan":
-        if t["status"] != "disiapkan" or i is None or bk[i]["status"] != "menunggu":
-            return 409, {"error": "Booking ini tidak sedang dicari."}
-        bk[i]["status"], t["status"] = "tidak_ditemukan", "bermasalah"
-        catat(t, "Booking %s tidak ditemukan" % bk[i]["kode"], oleh)
-    elif a == "layanan":
-        if t["status"] not in ("menunggu", "disiapkan", "bermasalah"):
-            return 409, {"error": "Layanan hanya bisa dikoreksi sebelum tiket siap."}
-        t["layanan"] = "sameday" if t["layanan"] == "instant" else "instant"
-        catat(t, "Layanan dikoreksi ke %s" % LAYANAN[t["layanan"]]["label"], oleh)
-    elif a == "siap":
+    if a == "done":
         if t["status"] != "disiapkan":
-            return 409, {"error": "Tiket belum disiapkan."}
-        if not all(x["status"] in ("dipindai", "dikeluarkan") for x in bk) or not any(x["status"] == "dipindai" for x in bk):
-            return 409, {"error": "Masih ada booking yang belum dipindai."}
+            return 409, {"error": "Tiket ini tidak sedang disiapkan."}
+        if t.get("sorter_email") != me["email"] and "supervisor" not in peran:
+            return 403, {"error": "Tiket ini dibagikan ke sorter lain (%s)." % (t["sorter"] or "-")}
         t["loket"] = pilih_loket(t["layanan"], cfg)
         set_config(c, cfg)
-        t["status"], t["ready_at"] = "siap", now_ms()
-        catat(t, ("Siap diambil di Loket %d" % t["loket"]) if t["loket"] else "Siap diambil, belum ada loket dibuka", oleh)
+        t["status"], t["ready_at"], t["siap_by"] = "siap", now_ms(), oleh
+        catat(t, ("Done sorter %s — siap di Loket %d" % (oleh, t["loket"])) if t["loket"] else "Done sorter %s — belum ada loket dibuka" % oleh, oleh)
+    elif a == "scan":
+        if t["status"] != "siap":
+            return 409, {"error": "%s belum siap diserahkan." % t["no"]}
+        no = norm_pesanan(b.get("no"))
+        if not NO_PESANAN.match(no):
+            return 400, {"error": "Nomor pesanan tidak valid. Pindai ulang barcode nomor pesanan di label."}
+        if no in t["pesanan"]:
+            return 409, {"error": "Nomor pesanan %s sudah dipindai di tiket ini." % no}
+        if len(t["pesanan"]) >= len(t["bookings"]):
+            return 409, {"error": "Jumlah paket sudah lengkap (%d). Hapus pindaian yang salah dulu." % len(t["bookings"])}
+        for r in c.execute("SELECT no, pesanan FROM tiket WHERE id<>? AND (status IN ('siap','selesai')) AND tgl>=?",
+                           (t["id"], tgl_wib(now_ms() - 3 * 86400000))):
+            if no in json.loads(r["pesanan"] or "[]"):
+                return 409, {"error": "Nomor pesanan %s sudah tercatat di tiket %s." % (no, r["no"])}
+        t["pesanan"].append(no)
+        catat(t, "Nomor pesanan %s dipindai" % no, oleh)
+    elif a == "hapus_scan":
+        i = int(b.get("i", -1))
+        if t["status"] != "siap" or not 0 <= i < len(t["pesanan"]):
+            return 409, {"error": "Pindaian tidak ditemukan."}
+        catat(t, "Pindaian %s dihapus" % t["pesanan"].pop(i), oleh)
     elif a == "serah":
         n = int(b.get("loket") or 0)
         if t["status"] != "siap":
             return 409, {"error": "%s berstatus %s, belum bisa diserahkan." % (t["no"], t["status"])}
         if t["loket"] != n:
             return 409, {"error": "%s untuk Loket %s. Arahkan driver ke sana." % (t["no"], t["loket"] or "–")}
-        t["status"], t["done_at"] = "selesai", now_ms()
+        if len(t["pesanan"]) != len(t["bookings"]):
+            return 409, {"error": "Pindai nomor pesanan semua paket dulu (%d dari %d)." % (len(t["pesanan"]), len(t["bookings"]))}
+        t["status"], t["done_at"], t["done_by"] = "selesai", now_ms(), oleh
         catat(t, "Diserahkan di Loket %d" % n, oleh)
-    elif a in ("cari_ulang", "keluarkan"):
-        if t["status"] != "bermasalah" or i is None or bk[i]["status"] != "tidak_ditemukan":
-            return 409, {"error": "Booking ini tidak sedang bermasalah."}
-        bk[i]["status"] = "menunggu" if a == "cari_ulang" else "dikeluarkan"
-        catat(t, ("Booking %s dicari ulang" if a == "cari_ulang" else "Booking %s dikeluarkan") % bk[i]["kode"], oleh)
-        if not any(x["status"] == "tidak_ditemukan" for x in bk):
-            if all(x["status"] == "dikeluarkan" for x in bk):
-                t["status"], t["cancel_reason"] = "dibatalkan", "semua booking dikeluarkan"
-            else:
-                t["status"] = "disiapkan" if t["taken_at"] else "menunggu"
+    elif a == "lepas":
+        if t["status"] != "disiapkan":
+            return 409, {"error": "Tiket ini tidak sedang di sorter."}
+        catat(t, "Ditarik dari sorter %s oleh supervisor" % (t["sorter"] or ""), oleh)
+        t["status"], t["sorter"], t["sorter_email"], t["taken_at"] = "menunggu", None, None, None
     elif a == "batal":
         if t["status"] not in AKTIF:
             return 409, {"error": "Tiket ini sudah tidak aktif."}
@@ -372,6 +543,8 @@ def aksi(c, b, me):
         t["returned"] = 1
         catat(t, "Paket dikembalikan ke rak", oleh)
     simpan(c, t)
+    if a == "lepas":
+        bagikan(c)
     return 200, {"ok": True}
 
 
@@ -381,18 +554,18 @@ def me_dari(h):
     if h.get("X-Voyage-Administrator") == "1":
         peran = {"sorter", "loket", "supervisor"}
     return {"nama": urllib.parse.unquote(h.get("X-Voyage-Name") or "") or (h.get("X-Voyage-Email") or "Staf"),
-            "email": h.get("X-Voyage-Email") or "", "role": role, "peran": sorted(peran)}
+            "email": (h.get("X-Voyage-Email") or "").strip().lower(), "role": role, "peran": sorted(peran)}
 
 
 # ---------- HTTP ----------
 # Publik (driver dari QR) HANYA halaman tiket per layanan + berkas yang dipakainya. Jalur lain (konsol staf, staff.js, dst.)
-# wajib gate — Caddy membuka jalur yang sama persis (lihat Caddyfile :8113); server menegakkannya lagi.
+# wajib gate — Caddy membuka jalur yang sama persis (lihat Caddyfile); server menegakkannya lagi.
 PUBLIK_HALAMAN = re.compile(r"^/antri/(instant|sameday)/?$")
 PUBLIK_STATIC = re.compile(r"^(driver\.js|app\.css|vendor/lucide\.min\.js|assets/[a-z0-9\-]+\.png)$")
 
 
 class H(BaseHTTPRequestHandler):
-    server_version = "QHouse/1"
+    server_version = "QHouse/2"
 
     def log_message(self, *a):
         pass
@@ -419,7 +592,7 @@ class H(BaseHTTPRequestHandler):
         ct = mimetypes.guess_type(p)[0] or "application/octet-stream"
         if ct.startswith("text/") or ct.endswith("javascript"):
             ct += "; charset=utf-8"
-        self.out(200, data, ct, {"Cache-Control": "public, max-age=3600"} if cache else None)
+        self.out(200, data, ct, {"Cache-Control": "public, max-age=300"} if cache else None)
 
     def gated(self):
         if not NEED_GATE:
@@ -458,17 +631,22 @@ class H(BaseHTTPRequestHandler):
         if p == "/api/publik/tiket":
             tok = (urllib.parse.parse_qs(u.query).get("t") or [""])[0]
             with tx() as c:
-                kedaluwarsa(c)
+                rawat(c)
                 r = c.execute("SELECT * FROM tiket WHERE token=?", (tok,)).fetchone() if len(tok) >= 16 else None
-                return self.out(200, tiket_publik(c, baris(r))) if r else self.out(404, {"error": "Tiket tidak ditemukan"})
+                res = tiket_publik(c, baris(r)) if r else None
+            return self.out(200, res) if res else self.out(404, {"error": "Tiket tidak ditemukan"})
         if not self.gated():
             return
         if p in ("/", "/sorter", "/loket", "/supervisor", "/barcode"):
             return self.berkas("staff.html")
         if p == "/api/state":
+            me = me_dari(self.headers)
+            tab = (urllib.parse.parse_qs(u.query).get("tab") or [""])[0][:20]
             with tx() as c:
-                kedaluwarsa(c)
-                return self.out(200, state(c, me_dari(self.headers)))
+                hadir_catat(c, me, tab)
+                rawat(c)
+                res = state(c, me)
+            return self.out(200, res)
         self.out(404, {"error": "tidak ada"})
 
     def do_POST(self):
@@ -484,7 +662,7 @@ class H(BaseHTTPRequestHandler):
             return
         if p == "/api/aksi":
             with tx() as c:
-                kedaluwarsa(c)
+                rawat(c)
                 code, res = aksi(c, b, me_dari(self.headers))
             return self.out(code, res)
         self.out(404, {"error": "tidak ada"})
@@ -494,8 +672,10 @@ def main():
     if NEED_GATE and len(GATE_SECRET) < 24:
         raise SystemExit("GATE_SECRET wajib diisi (>= 24 karakter) — sama dengan voyage-gate")
     init()
+    threading.Thread(target=penjadwal, daemon=True).start()
     port = int(os.environ.get("PORT", "8000"))
-    print("Q-House jalan di :%d (data %s)" % (port, DB_PATH), flush=True)
+    print("Q-House jalan di :%d (data %s; validasi BigSeller %s)" % (port, DB_PATH, "siap" if VOYAGE_INTERNAL and VOYAGE_KEY else "BELUM tersambung"),
+          flush=True)
     ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
 
 

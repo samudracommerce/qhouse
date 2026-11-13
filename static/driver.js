@@ -38,8 +38,8 @@ function form(){
   <div class="field"><label for="d-hp">Nomor HP</label><input class="input num" id="d-hp" inputmode="tel" autocomplete="tel" maxlength="16" placeholder="08xx xxxx xxxx"></div>
   <div class="field"><label for="d-plat">Plat nomor <span class="hint">(opsional)</span></label><input class="input" id="d-plat" maxlength="16" placeholder="B 1234 XYZ"></div>
   <div class="field"><label for="d-kode">Nomor booking</label>
-    <div class="addrow"><input class="input code-input" id="d-kode" maxlength="4" autocomplete="off" autocapitalize="characters" placeholder="941G"><button class="btn btn-outline" type="button" data-act="add"><i data-lucide="plus"></i>Tambah</button></div>
-    <span class="hint">4 karakter dari aplikasi Shopee driver. Ulangi untuk setiap pesanan.</span></div>
+    <input class="input code-input" id="d-kode" maxlength="4" autocomplete="off" autocapitalize="characters" placeholder="941G">
+    <span class="hint">Ketik 4 karakter dari aplikasi Shopee driver — otomatis masuk daftar. Lanjut ketik nomor berikutnya.</span></div>
   ${ui.codes.length?`<div class="codes">${ui.codes.map((c,i)=>`<div class="row"><span class="k">${esc(c)}</span><span class="s">ditambahkan</span><button class="icon-x" type="button" data-act="del" data-i="${i}" aria-label="Hapus ${esc(c)}"><i data-lucide="x"></i></button></div>`).join('')}</div>`:''}
   ${ui.err?`<p class="err">${esc(ui.err)}</p>`:''}
   <button class="btn btn-primary btn-block" type="button" data-act="kirim" ${ok&&!ui.busy?'':'disabled'}><i data-lucide="send"></i>Kirim tiket${ok?` (${ui.codes.length} nomor booking)`:''}</button>`;
@@ -117,7 +117,8 @@ document.addEventListener('click', e => {
   else if(a==='baru'){ lsSet(null); ui.t=null; render(); }
 });
 document.addEventListener('keydown', e => { if(e.key==='Enter' && e.target.id==='d-kode'){ e.preventDefault(); tambah(); } });
-document.addEventListener('input', e => { if(e.target.id==='d-kode'){ const v=normCode(e.target.value); if(v!==e.target.value) e.target.value=v; } });
+// nomor booking otomatis masuk daftar begitu 4 karakter terisi (tanpa tombol Tambah) — Sheva 12 Nov 2026
+document.addEventListener('input', e => { if(e.target.id==='d-kode'){ const v=normCode(e.target.value); if(v!==e.target.value) e.target.value=v; if(v.length===4) tambah(); } });
 
 (async () => { await muat(); render(); setInterval(async () => { if(lsGet()){ await muat(); const a=document.activeElement; if(!(a && a.tagName==='INPUT')) render(); } }, 5000); })();
 })();
