@@ -270,6 +270,29 @@ for k in range(7):                  # batas 6 tiket / 10 menit per IP -> percoba
     s, r = driver("instant", "Spam%d" % k, "08990000%04d" % k, ["ZZZZ"], ip="9.9.9.9")
 check(s == 429, "batas tiket per perangkat (rate limit)", r)
 
+# --- Q-House sebagai fitur Wareflow di PATH /qhouse (Sheva 16 Nov 2026) ---
+print("— prefix QH_BASE=/qhouse —")
+check(server.BASE == "", "bawaan tanpa prefix (perilaku lama)")
+s, h = req("GET", "/antri/instant")
+check(s == 200 and '<meta name="qh-base" content="">' in h and '"/static/driver.js"' in h, "tanpa prefix: halaman driver tetap di akar")
+server.BASE = "/qhouse"
+check(server.jalur("/qhouse/antri/instant") == "/antri/instant" and server.jalur("/qhouse") == "/" and server.jalur("/qhouse/") == "/"
+      and server.jalur("/qhousex/api") == "/qhousex/api" and server.jalur("/antri/sameday") == "/antri/sameday",
+      "jalur: prefix dipotong hanya bila tepat /qhouse atau /qhouse/…")
+s, h = req("GET", "/qhouse/antri/instant")
+check(s == 200 and '<meta name="qh-base" content="/qhouse">' in h and '"/qhouse/static/driver.js"' in h
+      and '"/qhouse/static/app.css"' in h and '"/static/' not in h, "halaman driver di /qhouse: semua berkas statis ber-prefix")
+check(req("GET", "/qhouse/static/driver.js")[0] == 200 and req("GET", "/qhouse/static/staff.js")[0] == 403,
+      "statis publik tetap publik; staff.js tetap wajib gate (lewat prefix)")
+s, r = req("POST", "/qhouse/api/publik/tiket", {"layanan": "sameday", "nama": "Driver Prefix", "hp": "081299990000", "kode": ["PREF1"]}, ip="7.7.7.7")
+check(s == 200 and r.get("token") and req("GET", "/qhouse/api/publik/tiket?t=" + r["token"])[0] == 200, "tiket driver lewat /qhouse/api/publik/tiket", r)
+check(req("GET", "/qhouse")[0] == 403 and req("GET", "/qhouse/sorter")[0] == 403, "konsol staf lewat prefix tetap wajib gate")
+s, h = req("GET", "/qhouse/supervisor", siapa="sup")
+check(s == 200 and '<meta name="qh-base" content="/qhouse">' in h and '"/qhouse/static/staff.js"' in h, "konsol staf di /qhouse/supervisor")
+check(req("GET", "/qhouse/api/state?tab=supervisor", siapa="sup")[0] == 200 and req("POST", "/qhouse/api/aksi", {"aksi": "batas", "menit": 30}, siapa="sup")[0] == 200,
+      "API staf lewat prefix")
+server.BASE = ""
+
 srv.shutdown()
 vsrv.shutdown()
 print(("MERAH ❌ %d gagal" % len(GAGAL)) if GAGAL else "HIJAU ✅ test_qhouse")

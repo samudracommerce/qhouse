@@ -1,6 +1,9 @@
 /* Q-House — konsol STAF (lewat voyage-gate). Tab mengikuti peran akun (me.peran): sorter, loket, supervisor; Barcode
    untuk supervisor. Data dari /api/state?tab=<tab> (polling 4 detik; tab=sorter = hadir sebagai sorter aktif -> menerima
    tiket otomatis); setiap perubahan lewat /api/aksi (server memeriksa peran). Alur versi 2 (Sheva 12 Nov 2026). */
+// Prefix jalur (Q-House = fitur Wareflow di /qhouse, Sheva 16 Nov 2026); kosong = di akar domain. Diisi server lewat meta qh-base.
+const BASE = (document.querySelector('meta[name="qh-base"]') || {}).content || '';
+const tabDariJalur = () => location.pathname.slice(BASE.length).replace(/^\/+|\/+$/g, '');
 (function(){
 'use strict';
 const LAY = {instant:{label:'SPX Instant', short:'Instant', cls:'p-instant'}, sameday:{label:'SPX Sameday', short:'Sameday', cls:'p-sameday'}};
@@ -24,15 +27,15 @@ const boleh = p => S && S.me.peran.includes(p);
 const all = () => S ? S.tickets : [];
 const byId = id => all().find(t => t.id===id);
 const batasMs = () => (Number(S.config.batasMenit)||30)*60000;
-const empty = (img, b, s) => `<div class="empty"><img src="/static/assets/${img}" alt="" width="96"><b>${b}</b>${s?`<span>${s}</span>`:''}</div>`;
+const empty = (img, b, s) => `<div class="empty"><img src="${BASE}/static/assets/${img}" alt="" width="96"><b>${b}</b>${s?`<span>${s}</span>`:''}</div>`;
 function toast(msg){ const el=document.getElementById('toast'); el.textContent=msg; el.hidden=false; clearTimeout(toast._t); toast._t=setTimeout(()=>{el.hidden=true;},3200); }
 
 async function muat(){
-  try{ const r = await fetch('/api/state?tab=' + encodeURIComponent(ui.tab||''), {cache:'no-store'}); if(!r.ok) throw new Error(r.status); S = await r.json(); S._at = Date.now(); ok = true; }
+  try{ const r = await fetch(BASE + '/api/state?tab=' + encodeURIComponent(ui.tab||''), {cache:'no-store'}); if(!r.ok) throw new Error(r.status); S = await r.json(); S._at = Date.now(); ok = true; }
   catch(e){ ok = false; }
 }
 async function kirim(body){
-  const r = await fetch('/api/aksi', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const r = await fetch(BASE + '/api/aksi', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   const j = await r.json().catch(()=>({})); return {ok:r.ok, j};
 }
 async function aksi(body, pesan){
@@ -48,10 +51,10 @@ function render(){
   dot.className = 'dot ' + (ok ? 'live' : 'warn');
   if(!S){ tx.textContent = 'Belum tersambung ke server. Mencoba lagi…'; view.innerHTML=''; return; }
   const tabs = TABS.filter(t => boleh(t[3]));
-  if(!ui.tab || !tabs.some(t=>t[0]===ui.tab)){ const h=location.pathname.replace('/',''); ui.tab = (tabs.find(t=>t[0]===h)||tabs[0]||[null])[0]; }
+  if(!ui.tab || !tabs.some(t=>t[0]===ui.tab)){ const h=tabDariJalur(); ui.tab = (tabs.find(t=>t[0]===h)||tabs[0]||[null])[0]; }
   const aktif = S.sorterAktif.some(s => s.email===S.me.email);
   tx.textContent = ok ? `${S.me.nama} · ${S.me.peran.length ? S.me.peran.join(', ') : 'lihat saja'}${ui.tab==='sorter'?(aktif?' · aktif menerima tiket':' · menyambung…'):''} · diperbarui otomatis` : 'Koneksi terputus. Mencoba lagi…';
-  document.getElementById('roles').innerHTML = tabs.map(t => `<a href="/${t[0]}" data-tab="${t[0]}" ${t[0]===ui.tab?'aria-current="page"':''}><i data-lucide="${t[1]}"></i><span>${t[2]}</span></a>`).join('');
+  document.getElementById('roles').innerHTML = tabs.map(t => `<a href="${BASE}/${t[0]}" data-tab="${t[0]}" ${t[0]===ui.tab?'aria-current="page"':''}><i data-lucide="${t[1]}"></i><span>${t[2]}</span></a>`).join('');
   const keep = {}; view.querySelectorAll('input[id]').forEach(el => keep[el.id] = el.value);
   const act = document.activeElement && document.activeElement.id;
   view.innerHTML = !ui.tab ? `<div class="card panel">${empty('vidi-sleepy.png','Akunmu belum punya peran di Q-House','Minta kepala divisi memberi peran Sorter, Loket, atau Supervisor lewat Voyage › Manage › Akses App › Wareflow.')}</div>`
@@ -221,7 +224,7 @@ function vBarcode(){
     <div class="how"><b style="color:var(--navy)">Scan untuk ambil nomor antrian</b><ol><li>Scan barcode ini dengan kamera HP.</li><li>Isi nama, nomor HP, dan semua nomor booking.</li><li>Tunggu sampai HP menunjukkan nomor loket.</li></ol><span class="url">${esc(qrUrl(l))}</span></div>
     <div class="acts"><button class="btn btn-primary btn-sm" type="button" data-act="b-dl" data-v="${l}"><i data-lucide="download"></i>Unduh PNG</button>
       <button class="btn btn-outline btn-sm" type="button" data-act="b-copy" data-v="${l}"><i data-lucide="copy"></i>Salin tautan</button>
-      <a class="btn btn-quiet btn-sm" href="/antri/${l}" target="_blank" rel="noopener"><i data-lucide="smartphone"></i>Buka halaman driver</a></div></article>`;
+      <a class="btn btn-quiet btn-sm" href="${BASE}/antri/${l}" target="_blank" rel="noopener"><i data-lucide="smartphone"></i>Buka halaman driver</a></div></article>`;
   return `<div class="stack" style="gap:20px"><div class="panel-head"><div><p class="eyebrow">Barcode statis</p><h2>Dua barcode untuk pintu gudang</h2></div></div>
     <div class="alert a-info"><i data-lucide="info"></i><span>Tempel barcode Instant dan Sameday di tempat terpisah. Layanan tiket otomatis mengikuti barcode yang di-scan. Halaman driver terbuka tanpa akun Voyage.</span></div>
     <div class="posters">${poster('instant')}${poster('sameday')}</div></div>`;
@@ -246,7 +249,7 @@ async function unduh(l){
 
 /* ---------- events ---------- */
 document.addEventListener('click', e => {
-  const tab = e.target.closest('[data-tab]'); if(tab){ e.preventDefault(); ui.tab=tab.dataset.tab; history.replaceState(null,'','/'+ui.tab); muat().then(render); render(); window.scrollTo(0,0); return; }
+  const tab = e.target.closest('[data-tab]'); if(tab){ e.preventDefault(); ui.tab=tab.dataset.tab; history.replaceState(null,'',BASE+'/'+ui.tab); muat().then(render); render(); window.scrollTo(0,0); return; }
   const el = e.target.closest('[data-act]'); if(!el || el.disabled) return; const a = el.dataset.act;
   if(a==='s-done'){ const t=byId(el.dataset.id); aksi({aksi:'done', id:el.dataset.id}).then(r=>{ if(r){ const x=byId(el.dataset.id); toast(x&&x.loket?`${t.no} dikirim ke Loket ${x.loket}`:`${t.no} siap, tapi belum ada loket ${LAY[t.layanan].short} yang dibuka`); } }); }
   else if(a.startsWith('l-')) loketAct(a, el);
@@ -264,7 +267,7 @@ document.addEventListener('input', e => { if(e.target.id==='sv-q'){ ui.q=e.targe
 document.addEventListener('change', e => { const t=e.target; if(t.dataset.change==='c-lay') aksi({aksi:'loket_layanan', i:Number(t.dataset.i), layanan:t.value}); });
 
 (async () => {
-  const h = location.pathname.replace('/',''); if(['sorter','loket','supervisor','barcode'].includes(h)) ui.tab = h;
+  const h = tabDariJalur(); if(['sorter','loket','supervisor','barcode'].includes(h)) ui.tab = h;
   await muat(); render(); await muat(); render();
   setInterval(async () => { await muat(); const a=document.activeElement; if(!(a && (a.tagName==='INPUT'||a.tagName==='SELECT'))) render(); }, 4000);
 })();

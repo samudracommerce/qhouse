@@ -1,5 +1,7 @@
 /* Q-House — halaman DRIVER (publik, tanpa akun). Dibuka dari QR di pintu gudang: /antri/instant atau /antri/sameday.
    Tiket disimpan di perangkat lewat token acak; halaman memperbarui status tiap 5 detik. */
+// Prefix jalur (Q-House = fitur Wareflow di /qhouse, Sheva 16 Nov 2026); kosong = di akar domain. Diisi server lewat meta qh-base.
+const BASE = (document.querySelector('meta[name="qh-base"]') || {}).content || '';
 (function(){
 'use strict';
 const LAY = {instant:{label:'SPX Instant', short:'Instant', cls:'p-instant', sub:'termasuk Instant Prioritas'},
@@ -61,7 +63,7 @@ function steps(t){
 }
 
 function tiket(t){
-  if(t.status==='selesai') return `<div class="done-art"><img src="/static/assets/vidi-thankyou.png" alt="Vidi, maskot VitaminDiskon, berterima kasih" width="150" height="171">
+  if(t.status==='selesai') return `<div class="done-art"><img src="${BASE}/static/assets/vidi-thankyou.png" alt="Vidi, maskot VitaminDiskon, berterima kasih" width="150" height="171">
       <p class="eyebrow">Tiket ${esc(t.no)}</p><h2>Paket sudah diserahkan</h2><p class="hint">Diserahkan di Loket ${esc(t.loket)} pukul ${hhmm(t.doneAt)}. Terima kasih, hati-hati di jalan.</p></div>
       ${steps(t)}<button class="btn btn-outline btn-block" type="button" data-act="baru"><i data-lucide="plus"></i>Buat tiket baru</button>`;
   let al = '';
@@ -96,7 +98,7 @@ async function kirim(){
   const sisa = normCode(val('d-kode')); if(sisa.length===4 && !ui.codes.includes(sisa)) ui.codes.push(sisa);
   ui.err=''; ui.busy=true; render();
   try{
-    const r = await api('POST', '/api/publik/tiket', {layanan: lock || ui.layanan, nama: val('d-nama'), hp: val('d-hp'), plat: val('d-plat'), kode: ui.codes});
+    const r = await api('POST', BASE + '/api/publik/tiket', {layanan: lock || ui.layanan, nama: val('d-nama'), hp: val('d-hp'), plat: val('d-plat'), kode: ui.codes});
     lsSet(r.token); ui.codes=[]; toast(r.ada ? `Tiket aktifmu ${r.no} dibuka lagi` : `Tiket ${r.no} dibuat`); await muat();
   }catch(e){ ui.err = e.message; }
   ui.busy=false; render();
@@ -104,7 +106,7 @@ async function kirim(){
 
 async function muat(){
   const tok = lsGet(); if(!tok){ ui.t=null; return; }
-  try{ ui.t = await api('GET', '/api/publik/tiket?t=' + encodeURIComponent(tok)); }
+  try{ ui.t = await api('GET', BASE + '/api/publik/tiket?t=' + encodeURIComponent(tok)); }
   catch(e){ if(e.status===404){ lsSet(null); ui.t=null; } }
 }
 

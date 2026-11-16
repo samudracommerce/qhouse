@@ -28,6 +28,11 @@ DB_PATH = os.path.join(DATA, "qhouse.db")
 GATE_SECRET = os.environ.get("GATE_SECRET", "")
 NEED_GATE = os.environ.get("QH_REQUIRE_GATE", "1") == "1"
 PUBLIC_URL = os.environ.get("QH_PUBLIC_URL", "http://localhost:8113").rstrip("/")
+# Q-House = fitur Wareflow di PATH (Sheva 16 Nov 2026): wareflow.samudracommerce.com/qhouse/… → QH_BASE="/qhouse".
+# Kosong = di akar domain (perilaku lama). Server menerima jalur dengan ATAU tanpa prefix (Caddy boleh memotong/meneruskannya).
+BASE = os.environ.get("QH_BASE", "").strip().rstrip("/")
+if BASE and not re.fullmatch(r"/[a-z0-9\-]+", BASE):
+    raise SystemExit("QH_BASE harus berbentuk /nama (huruf kecil, angka, -), mis. /qhouse")
 VOYAGE_URL = os.environ.get("QH_VOYAGE_URL", "").rstrip("/")
 VOYAGE_INTERNAL = os.environ.get("QH_VOYAGE_INTERNAL", "").rstrip("/")     # panggilan server-ke-server ke Voyage
 VOYAGE_KEY = os.environ.get("QH_VOYAGE_KEY", "")                          # api_key Voyage (= kunci layanan fleet)
@@ -564,6 +569,21 @@ PUBLIK_HALAMAN = re.compile(r"^/antri/(instant|sameday)/?$")
 PUBLIK_STATIC = re.compile(r"^(driver\.js|app\.css|vendor/lucide\.min\.js|assets/[a-z0-9\-]+\.png)$")
 
 
+def jalur(p):
+    """Jalur permintaan tanpa prefix QH_BASE: /qhouse/antri/instant -> /antri/instant, /qhouse -> /."""
+    if BASE and (p == BASE or p.startswith(BASE + "/")):
+        return p[len(BASE):] or "/"
+    return p
+
+
+def html_dengan_base(data):
+    """Halaman HTML: berkas statis & JS memakai prefix QH_BASE (meta qh-base dibaca staff.js / driver.js)."""
+    t = data.decode("utf-8")
+    t = t.replace('"/static/', '"%s/static/' % BASE)
+    t = t.replace("<head>", '<head>\n<meta name="qh-base" content="%s">' % BASE, 1)
+    return t.encode("utf-8")
+
+
 class H(BaseHTTPRequestHandler):
     server_version = "QHouse/2"
 
@@ -589,6 +609,8 @@ class H(BaseHTTPRequestHandler):
             return self.out(404, {"error": "tidak ada"})
         with open(p, "rb") as f:
             data = f.read()
+        if p.endswith(".html"):
+            data = html_dengan_base(data)
         ct = mimetypes.guess_type(p)[0] or "application/octet-stream"
         if ct.startswith("text/") or ct.endswith("javascript"):
             ct += "; charset=utf-8"
@@ -618,7 +640,7 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
-        p = u.path
+        p = jalur(u.path)
         if p == "/healthz":
             return self.out(200, {"ok": True})
         if p.startswith("/static/"):
@@ -650,7 +672,7 @@ class H(BaseHTTPRequestHandler):
         self.out(404, {"error": "tidak ada"})
 
     def do_POST(self):
-        p = urllib.parse.urlparse(self.path).path
+        p = jalur(urllib.parse.urlparse(self.path).path)
         b = self.body()
         if b is None or not isinstance(b, dict):
             return self.out(400, {"error": "Data tidak valid"})
